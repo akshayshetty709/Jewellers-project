@@ -1,0 +1,128 @@
+pipeline {
+    agent any
+
+    parameters {
+        string(name: 'BRANCH', defaultValue: 'release/0.1.0', description: 'Git branch to deploy')
+        string(name: 'HEALTH_URL', defaultValue: 'http://localhost:8080/health', description: 'URL checked on the server after deploy (change to your real health endpoint)')
+    }
+
+    environment {
+        SERVER   = 'ubuntu@3.133.28.120'
+        APP_DIR  = '/home/ubuntu/routeiq-api-gateway'
+        REPO     = 'git@github.com:Route-iq-kiaq/routeiq-api-gateway.git'
+        // Requires the server key in Jenkins' known_hosts. One-time setup on the Jenkins machine:
+        //   ssh-keyscan -H 3.133.28.120 >> ~/.ssh/known_hosts
+        SSH_OPTS = '-o StrictHostKeyChecking=yes'
+    }
+
+    options {
+        timeout(time: 30, unit: 'MINUTES')
+        disableConcurrentBuilds()
+    }
+
+    stages {
+        stage('Clone new release') {
+            steps {
+                sshagent(['routeiq-backend']) {
+                    sh '''
+ssh -A $SSH_OPTS $SERVER "APP_DIR=$APP_DIR REPO=$REPO BRANCH=$BRANCH bash -s" <<'EOF'
+set -e
+rm -rf "${APP_DIR}_new"
+git clone -b "$BRANCH" "$REPO" "${APP_DIR}_new"
+cd "${APP_DIR}_new"
+chmod +x clone.sh
+./clone.sh
+test -d routeiq-auth-service
+test -d routeiq-user-service
+test -d routeiq-notification-service
+EOF
+                    '''
+                }
+            }
+        }
+
+        stage('Copy env files') {
+            steps {
+                sshagent(['routeiq-backend']) {
+                    withCredentials([
+                        file(credentialsId: 'routeiq-api-gateway', variable: 'GATEWAY_ENV_PATH'),
+                        file(credentialsId: 'routeiq-auth-service', variable: 'AUTH_ENV_PATH'),
+                        file(credentialsId: 'routeiq-user-service', variable: 'USER_ENV_PATH'),
+                        file(credentialsId: 'routeiq-notification-service', variable: 'NOTIFICATION_ENV_PATH')
+                    ]) {
+                        sh '''
+                            set -e
+                            NEW="${APP_DIR}_new"
+                            ssh $SSH_OPTS $SERVER "mkdir -p $NEW/gatewayservice $NEW/routeiq-auth-service $NEW/routeiq-user-service $NEW/routeiq-notification-service"
+                            scp $SSH_OPTS "$GATEWAY_ENV_PATH"      $SERVER:$NEW/gatewayservice/.env
+                            scp $SSH_OPTS "$AUTH_ENV_PATH"         $SERVER:$NEW/routeiq-auth-service/.env
+                            scp $SSH_OPTS "$USER_ENV_PATH"         $SERVER:$NEW/routeiq-user-service/.env
+                            scp $SSH_OPTS "$NOTIFICATION_ENV_PATH" $SERVER:$NEW/routeiq-notification-service/.env
+                            ssh $SSH_OPTS $SERVER "chmod 600 $NEW/gatewayservice/.env $NEW/routeiq-auth-service/.env $NEW/routeiq-user-service/.env $NEW/routeiq-notification-service/.env"
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Build and switch') {
+            steps {
+                sshagent(['routeiq-backend']) {
+                    sh '''
+ssh $SSH_OPTS $SERVER "APP_DIR=$APP_DIR HEALTH_URL=$HEALTH_URL bash -s" <<'EOF'
+set -e
+
+# 1. Validate and build the new version BEFORE touching the running one
+cd "${APP_DIR}_new"
+docker compose config -q
+docker compose build
+
+# 2. Stop the old version and swap folders (old one kept for rollback)
+if [ -d "$APP_DIR" ]; then
+  (cd "$APP_DIR" && docker compose down) || true
+  rm -rf "${APP_DIR}_old"
+  mv "$APP_DIR" "${APP_DIR}_old"
+fi
+mv "${APP_DIR}_new" "$APP_DIR"
+
+# 3. Start the new version
+cd "$APP_DIR"
+docker compose up -d --remove-orphans
+
+# 4. Health check (retry for up to ~60s); roll back if it never responds
+ok=0
+for i in $(seq 1 12); do
+  if curl -fsS "$HEALTH_URL" > /dev/null; then ok=1; break; fi
+  sleep 5
+done
+
+if [ "$ok" -ne 1 ]; then
+  echo "Health check failed. Rolling back..."
+  docker compose down || true
+  if [ -d "${APP_DIR}_old" ]; then
+    rm -rf "$APP_DIR"
+    mv "${APP_DIR}_old" "$APP_DIR"
+    cd "$APP_DIR" && docker compose up -d
+  fi
+  exit 1
+fi
+
+docker compose ps
+docker image prune -f
+EOF
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "Routeiq backend deployed successfully (branch: ${params.BRANCH})."
+        }
+        failure {
+            echo 'Routeiq backend deployment failed. Check Jenkins console logs.'
+            // Add Slack/email notification here, e.g. slackSend(...) or mail(...)
+        }
+    }
+}
