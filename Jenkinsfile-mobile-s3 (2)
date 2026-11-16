@@ -1,0 +1,154 @@
+pipeline {
+  agent any
+
+  options {
+    timestamps()
+    disableConcurrentBuilds()
+    timeout(time: 90, unit: 'MINUTES')
+  }
+
+  environment {
+    S3_BUCKET        = 'andriod-apk11'
+    APK_PATH         = 'android/app/build/outputs/apk/release/app-release.apk'
+    JAVA_HOME        = '/usr/lib/jvm/java-1.17.0-openjdk-amd64'
+
+    // Android SDK folder used by Jenkins (installed automatically if missing)
+    ANDROID_HOME     = '/opt/android-sdk'
+    ANDROID_SDK_ROOT = '/opt/android-sdk'
+
+    PATH             = "${JAVA_HOME}/bin:${ANDROID_HOME}/platform-tools:${ANDROID_HOME}/cmdline-tools/latest/bin:${env.PATH}"
+  }
+
+  stages {
+    stage('1. Checkout') {
+      steps {
+        git branch: 'main',
+            url: 'https://github.com/akshayshetty709/personal-finance-mobile.git'
+      }
+    }
+
+    stage('2. Load .env (Secret file)') {
+      steps {
+        // Jenkins > Credentials > Add > "Secret file" > ID: mobile-env-file
+        withCredentials([file(credentialsId: 'mobile-env-file', variable: 'ENV_FILE')]) {
+          // Single quotes: the secret path is expanded by the shell, not Groovy
+          sh 'cp "$ENV_FILE" .env'
+        }
+        // Print only the variable names, never the values
+        sh "sed 's/=.*/=***/' .env"
+      }
+    }
+
+    stage('3. Setup Android SDK') {
+      steps {
+        sh '''
+          set -e
+          echo "--- Running as: $(whoami)"
+          java -version
+
+          if [ -x "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" ]; then
+            echo "Android SDK already present at $ANDROID_HOME"
+          else
+            echo "Android SDK not found at $ANDROID_HOME, installing it now..."
+
+            if ! mkdir -p "$ANDROID_HOME/cmdline-tools" 2>/dev/null; then
+              echo "ERROR: user $(whoami) cannot create $ANDROID_HOME."
+              echo "Run once on the Jenkins machine, then rebuild:"
+              echo "  sudo mkdir -p $ANDROID_HOME && sudo chown -R jenkins:jenkins $ANDROID_HOME"
+              exit 1
+            fi
+
+            command -v curl  >/dev/null || { echo "curl is required (sudo apt install -y curl)"; exit 1; }
+            command -v unzip >/dev/null || { echo "unzip is required (sudo apt install -y unzip)"; exit 1; }
+
+            TMP_DIR=$(mktemp -d)
+            curl -fsSL -o "$TMP_DIR/cmdline-tools.zip" \
+              https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+            unzip -q "$TMP_DIR/cmdline-tools.zip" -d "$TMP_DIR"
+            rm -rf "$ANDROID_HOME/cmdline-tools/latest"
+            mv "$TMP_DIR/cmdline-tools" "$ANDROID_HOME/cmdline-tools/latest"
+            rm -rf "$TMP_DIR"
+          fi
+
+          if [ ! -w "$ANDROID_HOME" ]; then
+            echo "ERROR: user $(whoami) cannot write to $ANDROID_HOME"
+            echo "Run: sudo chown -R jenkins:jenkins $ANDROID_HOME"
+            exit 1
+          fi
+
+          # Licenses accepted by another user do not apply to the jenkins user
+          yes | sdkmanager --licenses --sdk_root="$ANDROID_HOME" > /dev/null || true
+
+          # Platform, build-tools and NDK are downloaded by Gradle on demand
+          sdkmanager --sdk_root="$ANDROID_HOME" "platform-tools"
+
+          ls "$ANDROID_HOME"
+        '''
+      }
+    }
+
+    stage('4. npm install') {
+      steps {
+        sh 'rm -rf node_modules'
+        sh 'npm ci'
+      }
+    }
+
+    stage('5. prebuild') {
+      steps {
+        sh 'npx expo install --fix'
+        sh 'npx expo prebuild'
+      }
+    }
+
+    stage('6. Build APK') {
+      steps {
+        // .env must exist here: EXPO_PUBLIC_* values are inlined during this build
+        // local.properties tells Gradle where the SDK is (fixes "SDK location not found")
+        sh '''
+          echo "sdk.dir=$ANDROID_HOME" > android/local.properties
+          cd android &&
+          chmod +x gradlew &&
+          ./gradlew assembleRelease --build-cache --no-daemon
+        '''
+      }
+    }
+
+    stage('7. Upload APK to S3') {
+      steps {
+        withCredentials([
+          aws(credentialsId: 'AWS-Cred',
+              accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+              secretKeyVariable: 'AWS_SECRET_ACCESS_KEY')
+        ]) {
+          sh '''
+            aws s3 cp ${APK_PATH} s3://${S3_BUCKET}/releases/app-release-${BUILD_NUMBER}.apk
+            aws s3 cp ${APK_PATH} s3://${S3_BUCKET}/latest/app-release.apk
+          '''
+        }
+      }
+    }
+  }
+
+  post {
+    success {
+      echo "Build #${env.BUILD_NUMBER} succeeded."
+      echo "APK: s3://${S3_BUCKET}/releases/app-release-${env.BUILD_NUMBER}.apk"
+      echo "Latest: s3://${S3_BUCKET}/latest/app-release.apk"
+    }
+    failure {
+      echo "Build #${env.BUILD_NUMBER} FAILED. Check the stage above that turned red."
+      echo 'Common causes: Android SDK path or permissions, Gradle OOM kill (check free -h), missing secret file or AWS credential ID, or Java version.'
+    }
+    unstable {
+      echo "Build #${env.BUILD_NUMBER} is unstable."
+    }
+    always {
+      // Never leave the secret .env on the Jenkins disk
+      sh 'rm -f .env'
+      sh 'if [ -d android ]; then cd android && ./gradlew --stop || true; fi'
+      archiveArtifacts artifacts: 'android/app/build/outputs/apk/release/*.apk',
+                       allowEmptyArchive: true, fingerprint: true
+    }
+  }
+}
