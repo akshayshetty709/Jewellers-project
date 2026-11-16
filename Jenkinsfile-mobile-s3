@@ -1,0 +1,99 @@
+pipeline {
+  agent any
+
+  options {
+    timestamps()
+    disableConcurrentBuilds()
+    timeout(time: 60, unit: 'MINUTES')
+  }
+
+  environment {
+    S3_BUCKET = 'andriod-apk11'
+    APK_PATH  = 'android/app/build/outputs/apk/release/app-release.apk'
+    JAVA_HOME = '/usr/lib/jvm/java-1.17.0-openjdk-amd64'
+    PATH      = "${JAVA_HOME}/bin:${env.PATH}"
+  }
+
+  stages {
+    stage('1. Checkout') {
+      steps {
+        git branch: 'main',
+            url: 'https://github.com/akshayshetty709/personal-finance-mobile.git'
+      }
+    }
+
+    stage('2. Load .env (Secret file)') {
+      steps {
+        // Jenkins > Credentials > Add > "Secret file" > ID: mobile-env-file
+        withCredentials([file(credentialsId: 'mobile-env-file', variable: 'ENV_FILE')]) {
+          // Single quotes: the secret path is expanded by the shell, not Groovy
+          sh 'cp "$ENV_FILE" .env'
+        }
+        // Print only the variable names, never the values
+        sh "sed 's/=.*/=***/' .env"
+      }
+    }
+
+    stage('3. npm install') {
+      steps {
+        sh 'rm -rf node_modules'
+        sh 'npm ci'
+      }
+    }
+
+    stage('4. prebuild') {
+      steps {
+        sh 'npx expo install --fix'
+        sh 'npx expo prebuild'
+      }
+    }
+
+    stage('5. Build APK') {
+      steps {
+        // .env must exist here: EXPO_PUBLIC_* values are inlined during this build
+        sh '''
+          cd android &&
+          chmod +x gradlew &&
+          ./gradlew assembleRelease --build-cache --no-daemon
+        '''
+      }
+    }
+
+    stage('6. Upload APK to S3') {
+      steps {
+        withCredentials([
+          aws(credentialsId: 'AWS-Cred',
+              accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+              secretKeyVariable: 'AWS_SECRET_ACCESS_KEY')
+        ]) {
+          sh '''
+            aws s3 cp ${APK_PATH} s3://${S3_BUCKET}/releases/app-release-${BUILD_NUMBER}.apk
+            aws s3 cp ${APK_PATH} s3://${S3_BUCKET}/latest/app-release.apk
+          '''
+        }
+      }
+    }
+  }
+
+  post {
+    success {
+      echo "Build #${env.BUILD_NUMBER} succeeded."
+      echo "APK: s3://${S3_BUCKET}/releases/app-release-${env.BUILD_NUMBER}.apk"
+      echo "Latest: s3://${S3_BUCKET}/latest/app-release.apk"
+    }
+    failure {
+      echo "Build #${env.BUILD_NUMBER} FAILED. Check the stage above that turned red."
+      echo 'Common causes: Gradle OOM kill (check free -h), missing secret file or AWS credential ID, or Java/SDK path.'
+    }
+    unstable {
+      echo "Build #${env.BUILD_NUMBER} is unstable."
+    }
+    always {
+      // Never leave the secret .env on the Jenkins disk
+      sh 'rm -f .env'
+      sh 'cd android && ./gradlew --stop || true'
+      archiveArtifacts artifacts: 'android/app/build/outputs/apk/release/*.apk',
+                       allowEmptyArchive: true, fingerprint: true
+    }
+  }
+}
