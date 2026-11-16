@@ -1,0 +1,116 @@
+pipeline {
+    agent any
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '10', artifactNumToKeepStr: '5'))
+        timeout(time: 60, unit: 'MINUTES')
+    }
+
+    parameters {
+        choice(name: 'BUILD_TYPE', choices: ['release', 'debug'], description: 'APK build type')
+        string(name: 'ABIS', defaultValue: 'arm64-v8a', description: 'CPU architectures (comma separated). arm64-v8a covers most phones and keeps RAM use low')
+    }
+
+    environment {
+        CI                  = 'true'
+        EXPO_NO_TELEMETRY   = '1'
+        // Keep Gradle memory low so the daemon is not killed by the OOM killer
+        GRADLE_OPTS         = '-Dorg.gradle.jvmargs="-Xmx2g -XX:MaxMetaspaceSize=512m" -Dorg.gradle.daemon=false'
+        // Set these on the Jenkins agent if they are not already global
+        // ANDROID_HOME     = '/home/jenkins/Android/Sdk'
+    }
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Install Dependencies') {
+            steps {
+                sh 'node -v && npm -v'
+                sh 'npm ci'
+            }
+        }
+
+        stage('Checks') {
+            steps {
+                // Type check (non-blocking lint can be added later)
+                sh 'npx tsc --noEmit'
+
+                // Guard against the issues we hit earlier
+                sh '''
+                    grep -q 'baseUrl: "http' src/services/api/rootApi.ts \
+                      || { echo "rootApi.ts has no hardcoded baseUrl"; exit 1; }
+                    if grep -n 'localhost\\|127.0.0.1\\|10.0.2.2' src/services/api/rootApi.ts; then
+                      echo "rootApi.ts points to a local address"; exit 1
+                    fi
+                    grep -q 'usesCleartextTraffic="true"' android/app/src/main/AndroidManifest.xml \
+                      || { echo "usesCleartextTraffic missing in AndroidManifest.xml"; exit 1; }
+                    grep -q 'android.permission.INTERNET' android/app/src/main/AndroidManifest.xml \
+                      || { echo "INTERNET permission missing"; exit 1; }
+                '''
+            }
+        }
+
+        stage('Backend Reachability') {
+            steps {
+                // The build should not ship if the API is down (e.g. Redis down gives a 500)
+                sh '''
+                    code=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+                      http://52.14.137.36:8000/api/auth/login \
+                      -H "Content-Type: application/json" \
+                      -d '{"email":"healthcheck@invalid.test","password":"invalid"}')
+                    echo "Login endpoint returned HTTP $code"
+                    if [ "$code" -ge 500 ] || [ "$code" -eq 000 ]; then
+                      echo "Backend unhealthy, aborting build"; exit 1
+                    fi
+                '''
+            }
+        }
+
+        stage('Build APK') {
+            steps {
+                dir('android') {
+                    sh 'chmod +x gradlew'
+                    script {
+                        def task = params.BUILD_TYPE == 'release' ? 'assembleRelease' : 'assembleDebug'
+                        sh "./gradlew ${task} --no-daemon -PreactNativeArchitectures=${params.ABIS}"
+                    }
+                }
+            }
+        }
+
+        stage('Archive APK') {
+            steps {
+                script {
+                    def apkName = "infoez-${params.BUILD_TYPE}-${env.BUILD_NUMBER}.apk"
+                    sh """
+                        mkdir -p dist
+                        cp android/app/build/outputs/apk/${params.BUILD_TYPE}/*.apk dist/${apkName}
+                        ls -lh dist
+                    """
+                }
+                archiveArtifacts artifacts: 'dist/*.apk', fingerprint: true
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "APK ready: open this build in Jenkins and download it from Artifacts."
+        }
+        failure {
+            echo 'Build FAILED. Common causes: Gradle OOM kill (check free -h), missing Android SDK, or backend down.'
+        }
+        always {
+            // Free disk and stop leftover Gradle processes
+            sh 'cd android && ./gradlew --stop || true'
+            cleanWs(deleteDirs: true, patterns: [[pattern: 'android/app/build/**', type: 'INCLUDE']])
+        }
+    }
+}
